@@ -1,0 +1,3 @@
+# requirements 锁定文件示例：workflow 的 pip_requirements 参数可直接填本文件路径，
+# 构建期即固化版本；其 sha256 会记录在 build-metadata.json 中供审计。
+requests==2.32.3

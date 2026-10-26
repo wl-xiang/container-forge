@@ -1,0 +1,353 @@
+name: build-image
+
+# =============================================================================
+# 可配置 Python 开发/运行镜像构建 Workflow
+#
+# 用法: 在 Actions 页面手动触发 (workflow_dispatch)，按参数动态生成 Dockerfile
+#       并构建镜像。产物: 推送到 Registry（可选）和/或 离线 tar 包（可选）。
+#
+# 安全约定:
+#   - 仓库中不存放任何密钥；私有 Registry 凭据使用 Secrets:
+#       REGISTRY_USERNAME / REGISTRY_PASSWORD
+#   - GHCR（registry 留空时的默认目标）使用内置 GITHUB_TOKEN，无需额外配置。
+#   - 所有自由文本输入一律通过环境变量传入 shell，避免脚本注入。
+#   - 包名/基础镜像在 scripts/generate_dockerfile.py 中做白名单校验。
+#
+# 日志约定: 各阶段以「阶段N」命名并使用 ::group 折叠，失败时可快速定位
+#           Dockerfile 生成 / 构建测试 / 推送 / 导出 具体环节（AC-11）。
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: "镜像名称（不含 tag）。registry 留空且不含 / 时，推送目标为 ghcr.io/<owner>/<image_name>"
+        required: true
+        type: string
+      image_tag:
+        description: "镜像 tag，留空默认使用 git short sha"
+        required: false
+        default: ""
+        type: string
+      python_version:
+        description: "Python 版本（决定默认基础镜像与标签），如 3.11"
+        required: false
+        default: "3.11"
+        type: string
+      base_image:
+        description: "基础镜像（必须包含 /bin/bash），留空则使用 python:<python_version>-slim"
+        required: false
+        default: ""
+        type: string
+      apt_packages:
+        description: "额外 apt 包，逗号或换行分隔，如: vim,procps,openssh-client"
+        required: false
+        default: ""
+        type: string
+      pip_packages:
+        description: "额外 pip 包，逗号或换行分隔，可带版本约束，如: requests==2.32.3,fastapi"
+        required: false
+        default: ""
+        type: string
+      pip_requirements:
+        description: "requirements：仓库内文件路径（如 examples/requirements.lock.txt）或直接粘贴内容"
+        required: false
+        default: ""
+        type: string
+      platforms:
+        description: "目标平台，逗号分隔: linux/amd64 或 linux/amd64,linux/arm64"
+        required: false
+        default: "linux/amd64"
+        type: string
+      push_enabled:
+        description: "构建后推送到镜像仓库"
+        required: false
+        default: false
+        type: boolean
+      registry:
+        description: "镜像仓库地址（如 registry.example.com），留空则使用 ghcr.io"
+        required: false
+        default: ""
+        type: string
+      export_tar:
+        description: "导出离线 tar 包供内网 docker load（仅支持单平台）"
+        required: false
+        default: false
+        type: boolean
+      non_root_user:
+        description: "使用非 root 用户（uid 1000）运行容器，默认 root"
+        required: false
+        default: false
+        type: boolean
+      extra_labels:
+        description: "额外 OCI label，key=value 逗号分隔"
+        required: false
+        default: ""
+        type: string
+
+# 最小权限：只读代码；仅推 GHCR 时需要 packages:write
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 阶段 1: 动态生成 Dockerfile + requirements + 构建元数据，并上传 Artifact 审计
+  # ---------------------------------------------------------------------------
+  generate:
+    name: 阶段1 - 生成 Dockerfile 与构建元数据
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IMAGE_NAME: ${{ inputs.image_name }}
+      IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+      PYTHON_VERSION: ${{ inputs.python_version }}
+      BASE_IMAGE: ${{ inputs.base_image }}
+      APT_PACKAGES: ${{ inputs.apt_packages }}
+      PIP_PACKAGES: ${{ inputs.pip_packages }}
+      PIP_REQUIREMENTS: ${{ inputs.pip_requirements }}
+      EXTRA_LABELS: ${{ inputs.extra_labels }}
+      NON_ROOT: ${{ inputs.non_root_user }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 生成 Dockerfile / requirements / build-metadata.json
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${IMAGE_TAG_INPUT}"
+          if [ -z "${IMAGE_TAG}" ]; then
+            IMAGE_TAG="${GITHUB_SHA::7}"
+            echo "image_tag 未指定，使用 git short sha: ${IMAGE_TAG}"
+          fi
+          NON_ROOT_FLAG=""
+          if [ "${NON_ROOT}" = "true" ]; then NON_ROOT_FLAG="--non-root"; fi
+          python3 scripts/generate_dockerfile.py \
+            --output-dir build-context \
+            --image-name "${IMAGE_NAME}" \
+            --image-tag "${IMAGE_TAG}" \
+            --python-version "${PYTHON_VERSION}" \
+            --base-image "${BASE_IMAGE}" \
+            --apt-packages "${APT_PACKAGES}" \
+            --pip-packages "${PIP_PACKAGES}" \
+            --pip-requirements "${PIP_REQUIREMENTS}" \
+            --extra-labels "${EXTRA_LABELS}" \
+            --revision "${GITHUB_SHA}" \
+            --repo-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            ${NON_ROOT_FLAG}
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: 展示生成的 Dockerfile
+        run: |
+          echo "::group::生成的 Dockerfile（已上传为 Artifact: dockerfile-and-metadata）"
+          cat build-context/Dockerfile
+          echo "::endgroup::"
+          if [ -f build-context/requirements.txt ]; then
+            echo "::group::生成的 requirements.txt"
+            cat build-context/requirements.txt
+            echo "::endgroup::"
+          fi
+
+      - name: 上传 Dockerfile 与构建元数据
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockerfile-and-metadata
+          path: build-context/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 阶段 2: Buildx 构建镜像；按参数推送 Registry / 本地冒烟测试 / 导出离线 tar
+  # ---------------------------------------------------------------------------
+  build:
+    name: 阶段2 - 构建镜像（推送 / 冒烟测试 / 导出）
+    needs: generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      IMAGE_NAME: ${{ inputs.image_name }}
+      IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+      REGISTRY: ${{ inputs.registry }}
+      PUSH_ENABLED: ${{ inputs.push_enabled }}
+      EXPORT_TAR: ${{ inputs.export_tar }}
+      PLATFORMS: ${{ inputs.platforms }}
+      PYTHON_VERSION: ${{ inputs.python_version }}
+      APT_PACKAGES: ${{ inputs.apt_packages }}
+      PIP_PACKAGES: ${{ inputs.pip_packages }}
+      REPOSITORY_OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 下载生成的 Dockerfile
+        uses: actions/download-artifact@v4
+        with:
+          name: dockerfile-and-metadata
+          path: build-context
+
+      - name: 计算镜像完整名称与标签
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="${IMAGE_TAG_INPUT}"
+          if [ -z "${IMAGE_TAG}" ]; then IMAGE_TAG="${SHORT_SHA}"; fi
+          if [ -n "${REGISTRY}" ]; then
+            FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          elif [[ "${IMAGE_NAME}" == *"/"* ]]; then
+            FULL_IMAGE="${IMAGE_NAME}"          # 已是完整引用，如 ghcr.io/owner/name
+          else
+            FULL_IMAGE="ghcr.io/${REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          fi
+          if [[ "${FULL_IMAGE}" =~ [A-Z] ]]; then
+            echo "::warning::镜像引用包含大写字母，多数 Registry 要求全小写: ${FULL_IMAGE}"
+          fi
+          PLATFORM_COUNT="$(printf '%s' "${PLATFORMS}" | awk -F',' '{n=0; for(i=1;i<=NF;i++) if ($i ~ /[^[:space:]]/) n++; print n}')"
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo "image_tag=${IMAGE_TAG}"
+            echo "full_image=${FULL_IMAGE}"
+            echo "platform_count=${PLATFORM_COUNT}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "FULL_IMAGE=${FULL_IMAGE}"
+            echo "IMAGE_TAG=${IMAGE_TAG}"
+            echo "PLATFORM_COUNT=${PLATFORM_COUNT}"
+          } >> "$GITHUB_ENV"
+          echo "完整镜像引用: ${FULL_IMAGE}:${IMAGE_TAG}（平台数: ${PLATFORM_COUNT}）"
+
+      - name: 校验参数组合（快速失败，明确阶段）
+        run: |
+          set -euo pipefail
+          if [ "${EXPORT_TAR}" = "true" ] && [ "${PLATFORM_COUNT}" -gt 1 ]; then
+            echo "::error::【导出阶段】export_tar 仅支持单平台导出（docker save 兼容格式限制），当前 platforms=${PLATFORMS}。请拆分为单平台构建，或仅推送多架构镜像。"
+            exit 1
+          fi
+          if [ "${PUSH_ENABLED}" != "true" ] && [ "${EXPORT_TAR}" != "true" ] && [ "${PLATFORM_COUNT}" -gt 1 ]; then
+            echo "::error::【构建阶段】不推送时镜像只能 --load 单平台。多平台构建请开启 push_enabled。"
+            exit 1
+          fi
+          if [ "${PUSH_ENABLED}" = "true" ] && [ -n "${REGISTRY}" ] && [ "${SECRETS_PRESENT}" != "true" ]; then
+            echo "::error::【推送阶段】已选择推送到 ${REGISTRY}，但仓库未配置 Secrets: REGISTRY_USERNAME / REGISTRY_PASSWORD。"
+            exit 1
+          fi
+          echo "::notice::参数校验通过: push=${PUSH_ENABLED} export_tar=${EXPORT_TAR} platforms=${PLATFORMS}"
+        env:
+          SECRETS_PRESENT: ${{ secrets.REGISTRY_USERNAME != '' && secrets.REGISTRY_PASSWORD != '' }}
+
+      - name: 配置 QEMU（arm64 等多架构构建需要）
+        if: ${{ contains(inputs.platforms, 'arm') }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: 配置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录私有 Registry
+        if: ${{ inputs.push_enabled && inputs.registry != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: 登录 GHCR（registry 留空时的默认仓库）
+        if: ${{ inputs.push_enabled && inputs.registry == '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: 构建并推送镜像（buildx --push）
+        if: ${{ inputs.push_enabled }}
+        run: |
+          set -euo pipefail
+          echo "::group::buildx build --push（platforms=${PLATFORMS}）"
+          docker buildx build \
+            --platform "${PLATFORMS}" \
+            --tag "${FULL_IMAGE}:${IMAGE_TAG}" \
+            --file build-context/Dockerfile \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --push \
+            build-context
+          echo "::endgroup::"
+          echo "::notice::镜像已推送: ${FULL_IMAGE}:${IMAGE_TAG}"
+
+      - name: 本地构建镜像（--load，用于冒烟测试与离线导出）
+        if: ${{ inputs.export_tar || !inputs.push_enabled }}
+        run: |
+          set -euo pipefail
+          echo "::group::buildx build --load（platforms=${PLATFORMS}）"
+          docker buildx build \
+            --platform "${PLATFORMS}" \
+            --tag "${FULL_IMAGE}:${IMAGE_TAG}" \
+            --file build-context/Dockerfile \
+            --load \
+            build-context
+          echo "::endgroup::"
+
+      - name: 冒烟测试（验证入口 / 基础工具 / 自定义依赖）
+        if: ${{ inputs.export_tar || !inputs.push_enabled }}
+        run: |
+          set -euo pipefail
+          bash tests/smoke-test.sh "${FULL_IMAGE}:${IMAGE_TAG}"
+
+      - name: 导出离线 tar 包并生成 sha256 校验
+        if: ${{ inputs.export_tar }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          SAFE_TAG="$(printf '%s' "${IMAGE_TAG}" | tr '/:' '--')"
+          SAFE_PLAT="$(printf '%s' "${PLATFORMS}" | tr '/' '-')"
+          OUT="dist/${SAFE_TAG}-${SAFE_PLAT}.tar.gz"
+          echo "::group::docker save -> ${OUT}"
+          docker save "${FULL_IMAGE}:${IMAGE_TAG}" | gzip > "${OUT}"
+          echo "::endgroup::"
+          sha256sum "${OUT}" > "${OUT}.sha256"
+          cp build-context/build-metadata.json dist/
+          {
+            echo "# 离线镜像导入说明（内网）"
+            echo "镜像引用   : ${FULL_IMAGE}:${IMAGE_TAG}"
+            echo "平台/Python: ${PLATFORMS} / ${PYTHON_VERSION}"
+            echo "校验       : sha256sum -c $(basename "${OUT}").sha256"
+            echo "导入       : gunzip -c $(basename "${OUT}") | docker load"
+            echo "验证       : docker run -it --rm ${FULL_IMAGE}:${IMAGE_TAG}"
+            echo "构建信息   : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > dist/IMPORT-README.txt
+          ls -lh dist/
+          echo "::notice::离线包已生成: ${OUT}"
+
+      - name: 上传离线镜像 Artifact
+        if: ${{ inputs.export_tar }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-image-${{ steps.meta.outputs.image_tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 汇总构建信息（审计）
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p build-summary
+          {
+            echo "full_image=${FULL_IMAGE:-}"
+            echo "image_tag=${IMAGE_TAG:-}"
+            echo "platforms=${PLATFORMS}"
+            echo "push_enabled=${PUSH_ENABLED}"
+            echo "export_tar=${EXPORT_TAR}"
+            echo "python_version=${PYTHON_VERSION}"
+            echo "git_revision=${GITHUB_SHA}"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > build-summary/build-info.txt
+          cat build-summary/build-info.txt
+
+      - name: 上传构建信息
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: build-summary/
+          if-no-files-found: error

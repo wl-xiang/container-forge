@@ -1,0 +1,49 @@
+# =============================================================================
+# docker-compose 模板：Python 开发/运行双模式演示（container-forge）
+#
+# 镜像来自本仓库 workflow 构建产物（内网 docker load 后的本地镜像，或内网 Registry）。
+# 使用前：把下面两个 service 的 image 改成你的镜像引用。
+#
+# ── 开发模式（dev）───────────────────────────────────────────────────────────
+#   源码通过 volume 映射进容器 /workspace，入口为 /bin/bash，交互式开发，
+#   宿主机改代码容器内立即生效，无需重新构建镜像。
+#   启动:  docker compose --profile dev up -d
+#   进入:  docker compose --profile dev exec dev bash
+#   （或一次性进入）docker compose run --rm dev
+#
+# ── 运行模式（run）───────────────────────────────────────────────────────────
+#   覆盖 entrypoint 为项目 bootstrap 脚本，容器启动即自动运行项目。
+#   前台:  docker compose --profile run up app        # 退出码直接可见
+#   后台:  docker compose --profile run up -d app
+#   日志:  docker compose --profile run logs -f app
+#
+# 切换说明：两个 service 通过 profiles 隔离，互不影响；也可以把 run 模式的
+# entrypoint/command 合并进你的单一 service。老版本 docker-compose（<1.28）
+# 不支持 profiles，可将不需要的 service 整段注释掉。
+# =============================================================================
+
+services:
+  dev:
+    profiles: ["dev"]
+    image: ghcr.io/your-org/pydev:latest        # ← 改为内网导入的镜像
+    working_dir: /workspace
+    entrypoint: ["/bin/bash"]                   # 开发模式：bash 交互入口（镜像默认值，此处显式写出便于阅读）
+    command: ["-l"]
+    stdin_open: true                            # 等价 docker -i
+    tty: true                                   # 等价 docker -t
+    environment:
+      PYTHONUNBUFFERED: "1"                     # 日志/打印实时输出
+    volumes:
+      - ./examples/demo-app:/workspace          # ← 开发模式核心：映射你的项目源码目录
+
+  app:
+    profiles: ["run"]
+    image: ghcr.io/your-org/pydev:latest        # ← 改为内网导入的镜像
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "/workspace/bootstrap.sh"]   # 运行模式核心：覆盖 entrypoint 执行项目 bootstrap 脚本
+    init: true                                  # 以 init 进程转发信号，保证优雅退出与退出码正确
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./examples/demo-app:/workspace          # ← 项目源码目录（需包含 bootstrap.sh）
+    restart: "no"                               # 便于观察退出码；生产可按需改为 unless-stopped
