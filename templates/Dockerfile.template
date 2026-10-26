@@ -1,0 +1,36 @@
+# =============================================================================
+# 本文件由 scripts/generate_dockerfile.py 基于 templates/Dockerfile.template 生成，
+# 请勿手工编辑；如需调整镜像结构，请修改模板或生成脚本。
+#
+# 生成时间    : {{CREATED}}
+# Git Revision: {{REVISION}}
+#
+# 镜像约定:
+#   - 默认入口 ENTRYPOINT ["/bin/bash"]，docker run -it IMAGE 可直接进入 bash
+#   - 工作目录 /workspace，业务源码通过 volume 挂载或后续构建阶段注入
+#   - 必装基线: python / git / curl / ca-certificates / bash
+# =============================================================================
+FROM {{BASE_IMAGE}}
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+{{APT_INSTALL_BLOCK}}
+
+{{PIP_INSTALL_BLOCK}}
+
+{{REQUIREMENTS_BLOCK}}
+
+{{LABELS_BLOCK}}
+
+{{NON_ROOT_BLOCK}}
+
+WORKDIR /workspace
+
+# 基础镜像自检：必须包含 /bin/bash（见 README「风险与缓解」）
+RUN test -x /bin/bash || { echo 'ERROR: base image does not contain /bin/bash'; exit 1; }
+
+ENTRYPOINT ["/bin/bash"]
+CMD ["-l"]

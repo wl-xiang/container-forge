@@ -1,0 +1,10 @@
+# 仓库根目录一般不作为构建上下文（Dockerfile 由 workflow 动态生成到 build-context/）。
+# 此文件用于防止误操作以仓库根目录构建时带入无关内容。
+.git
+.github
+build-context/
+dist/
+docs/
+examples/
+tests/
+*.md
